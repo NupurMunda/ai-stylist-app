@@ -1,4 +1,4 @@
-# AI Image Editor: Learn Your Style
+# AI Editor – Learning-Based Aesthetic Photo Editor
 
 A personalized AI-powered image editing app that learns your aesthetic from reference photos and enhances future images to match your style. Built with **Streamlit**, **CLIP embeddings**, and sticker-based overlays, it evolves over time based on user feedback and style preference.
 
