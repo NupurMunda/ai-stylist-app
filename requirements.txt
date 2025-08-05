@@ -1,12 +1,9 @@
 streamlit
-numpy
-opencv-python
+opencv-python-headless
 Pillow
-scikit-learn
+numpy
 torch
-ftfy
-regex
-tqdm
-rembg
 clip-anytorch
+rembg
+scikit-learn
 requests
