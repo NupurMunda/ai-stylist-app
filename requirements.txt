@@ -2,8 +2,8 @@ streamlit
 Pillow
 numpy
 torch
-clip-anytorch
 rembg
 scikit-learn
 scikit-image
 requests
+git+https://github.com/omerbt/clip-anytorch.git
