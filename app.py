@@ -9,7 +9,7 @@ from io import BytesIO
 import base64
 from sklearn.metrics.pairwise import cosine_similarity
 import torch
-import clip
+import clip_anytorch as clip
 from rembg import remove
 import random
 from typing import List, Tuple, Optional
