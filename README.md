@@ -1,4 +1,4 @@
-# AI Stylist – Learning-Based Aesthetic Photo Editor
+# AI Editor – Learning-Based Aesthetic Photo Editor
 
 This is a machine learning-powered web application built with Streamlit that learns your personal aesthetic from reference images and automatically applies similar edits to new photos.
 
