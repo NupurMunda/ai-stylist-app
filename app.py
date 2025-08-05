@@ -1,561 +1,582 @@
 import streamlit as st
-import cv2
 import numpy as np
-from PIL import Image, ImageEnhance, ImageDraw
-import io
-import os
-import json
-from pathlib import Path
-import torch
-from sklearn.metrics.pairwise import cosine_similarity
+import cv2
+from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
 import pickle
+import os
 import requests
-from datetime import datetime
-import hashlib
+from io import BytesIO
+import base64
+from sklearn.metrics.pairwise import cosine_similarity
+import torch
+import clip
+from rembg import remove
+import random
+from typing import List, Tuple, Optional
+import warnings
+warnings.filterwarnings("ignore")
 
-# NEW: Background removal imports
-try:
-    from rembg import remove
-    REMBG_AVAILABLE = True
-except ImportError:
-    REMBG_AVAILABLE = False
+# Configuration
+STYLE_VECTOR_PATH = "style_vector.pkl"
+REFERENCE_IMAGES_DIR = "reference_images"
+STICKERS_DIR = "stickers"
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", "")  # Add your OpenAI API key to Streamlit secrets
 
-# NEW: CLIP imports (using Hugging Face instead of OpenAI CLIP)
-try:
-    from transformers import CLIPProcessor, CLIPModel
-    CLIP_AVAILABLE = True
-except ImportError:
-    CLIP_AVAILABLE = False
+# Create directories if they don't exist
+os.makedirs(REFERENCE_IMAGES_DIR, exist_ok=True)
+os.makedirs(STICKERS_DIR, exist_ok=True)
 
-# Page configuration
-st.set_page_config(
-    page_title="🤖 Learning AI Stylist",
-    page_icon="🎨",
-    layout="wide"
-)
-
-# Constants
-STYLE_DATA_FILE = "aesthetic_style.pkl"
-FEEDBACK_DATA_FILE = "feedback_history.json"
-STICKERS_DIR = Path("stickers")
-REFERENCE_IMAGES_DIR = Path("reference_images")
-
-# NEW: Initialize directories
-STICKERS_DIR.mkdir(exist_ok=True)
-REFERENCE_IMAGES_DIR.mkdir(exist_ok=True)
-
-# NEW: Load CLIP model (cached) - Using Hugging Face
 @st.cache_resource
 def load_clip_model():
-    """Load CLIP model for image embeddings using Hugging Face"""
-    if not CLIP_AVAILABLE:
-        return None, None, None
-    
-    try:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        model.to(device)
-        return model, processor, device
-    except Exception as e:
-        st.error(f"❌ Error loading CLIP model: {e}")
-        return None, None, None
+    """Load CLIP model for image embedding extraction"""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    return model, preprocess, device
 
-# NEW: Style data management
-class StyleLearner:
+class AIStyler:
     def __init__(self):
+        self.model, self.preprocess, self.device = load_clip_model()
         self.style_vector = None
         self.reference_embeddings = []
-        self.feedback_history = []
-        self.load_style_data()
-    
-    def load_style_data(self):
-        """Load existing style data"""
-        if os.path.exists(STYLE_DATA_FILE):
-            try:
-                with open(STYLE_DATA_FILE, 'rb') as f:
-                    data = pickle.load(f)
-                    self.style_vector = data.get('style_vector')
-                    self.reference_embeddings = data.get('reference_embeddings', [])
-            except Exception as e:
-                st.warning(f"Could not load style data: {e}")
         
-        if os.path.exists(FEEDBACK_DATA_FILE):
-            try:
-                with open(FEEDBACK_DATA_FILE, 'r') as f:
-                    self.feedback_history = json.load(f)
-            except Exception as e:
-                st.warning(f"Could not load feedback history: {e}")
-    
-    def save_style_data(self):
-        """Save style data to disk"""
-        try:
-            data = {
-                'style_vector': self.style_vector,
-                'reference_embeddings': self.reference_embeddings,
-                'last_updated': datetime.now().isoformat()
-            }
-            with open(STYLE_DATA_FILE, 'wb') as f:
-                pickle.dump(data, f)
-            
-            with open(FEEDBACK_DATA_FILE, 'w') as f:
-                json.dump(self.feedback_history, f)
-            return True
-        except Exception as e:
-            st.error(f"Error saving style data: {e}")
-            return False
-    
-    def extract_embedding(self, image_pil, model, processor, device):
-        """Extract CLIP embedding from PIL image using Hugging Face"""
-        try:
-            # Process image
-            inputs = processor(images=image_pil, return_tensors="pt").to(device)
-            
-            # Get image embedding
-            with torch.no_grad():
-                image_features = model.get_image_features(**inputs)
-                # Normalize the features
-                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-            
-            return image_features.cpu().numpy().flatten()
-        except Exception as e:
-            st.error(f"Error extracting embedding: {e}")
-            return None
-    
-    def learn_from_references(self, reference_images, model, processor, device):
-        """Learn aesthetic style from reference images"""
-        embeddings = []
+    def extract_image_embedding(self, image: Image.Image) -> np.ndarray:
+        """Extract CLIP embedding from an image"""
+        # Preprocess image for CLIP
+        image_input = self.preprocess(image).unsqueeze(0).to(self.device)
         
-        for img_file in reference_images:
-            try:
-                img = Image.open(img_file).convert('RGB')
-                embedding = self.extract_embedding(img, model, processor, device)
-                if embedding is not None:
-                    embeddings.append(embedding)
-                    
-                    # NEW: Save reference image for future use
-                    img_hash = hashlib.md5(img_file.getvalue()).hexdigest()[:8]
-                    ref_path = REFERENCE_IMAGES_DIR / f"ref_{img_hash}.jpg"
-                    img.save(ref_path, 'JPEG', quality=85)
-                    
-            except Exception as e:
-                st.warning(f"Skipping invalid reference image: {e}")
-        
+        with torch.no_grad():
+            embedding = self.model.encode_image(image_input)
+            embedding = embedding.cpu().numpy().flatten()
+            # Normalize embedding
+            embedding = embedding / np.linalg.norm(embedding)
+            
+        return embedding
+    
+    def save_style_vector(self, embeddings: List[np.ndarray]):
+        """Save style vector computed from reference embeddings"""
         if embeddings:
-            self.reference_embeddings = embeddings
-            self.style_vector = np.mean(embeddings, axis=0)
-            self.save_style_data()
-            return len(embeddings)
-        return 0
-    
-    def update_from_feedback(self, image_pil, model, processor, device, liked=True):
-        """Update style based on user feedback"""
-        if not liked:
-            return False
-        
-        embedding = self.extract_embedding(image_pil, model, processor, device)
-        if embedding is not None:
-            # Add to reference embeddings
-            self.reference_embeddings.append(embedding)
+            # Average all embeddings to create style vector
+            style_vector = np.mean(embeddings, axis=0)
+            style_vector = style_vector / np.linalg.norm(style_vector)  # Normalize
             
-            # Recalculate style vector
-            self.style_vector = np.mean(self.reference_embeddings, axis=0)
-            
-            # Record feedback
-            feedback_entry = {
-                'timestamp': datetime.now().isoformat(),
-                'liked': liked,
-                'embedding_count': len(self.reference_embeddings)
+            # Save both the style vector and individual embeddings
+            style_data = {
+                'style_vector': style_vector,
+                'reference_embeddings': embeddings
             }
-            self.feedback_history.append(feedback_entry)
             
-            self.save_style_data()
+            with open(STYLE_VECTOR_PATH, 'wb') as f:
+                pickle.dump(style_data, f)
+            
+            self.style_vector = style_vector
+            self.reference_embeddings = embeddings
             return True
         return False
     
-    def get_style_similarity(self, image_pil, model, processor, device):
-        """Get similarity score between image and learned style"""
+    def load_style_vector(self) -> bool:
+        """Load existing style vector"""
+        if os.path.exists(STYLE_VECTOR_PATH):
+            try:
+                with open(STYLE_VECTOR_PATH, 'rb') as f:
+                    style_data = pickle.load(f)
+                    self.style_vector = style_data['style_vector']
+                    self.reference_embeddings = style_data.get('reference_embeddings', [])
+                return True
+            except:
+                return False
+        return False
+    
+    def calculate_similarity(self, image_embedding: np.ndarray) -> float:
+        """Calculate cosine similarity between image and style vector"""
         if self.style_vector is None:
-            return 0.5  # Default medium similarity
+            return 0.0
         
-        embedding = self.extract_embedding(image_pil, model, processor, device)
-        if embedding is not None:
-            similarity = cosine_similarity([embedding], [self.style_vector])[0][0]
-            return max(0, min(1, (similarity + 1) / 2))  # Normalize to 0-1
-        return 0.5
+        similarity = cosine_similarity([image_embedding], [self.style_vector])[0][0]
+        return max(0, similarity)  # Ensure non-negative
+    
+    def update_style_with_feedback(self, image_embedding: np.ndarray, liked: bool):
+        """Update style vector based on user feedback"""
+        if liked and image_embedding is not None:
+            # Add this embedding to our reference set
+            self.reference_embeddings.append(image_embedding)
+            
+            # Recompute style vector
+            self.save_style_vector(self.reference_embeddings)
+            return True
+        return False
 
-# NEW: AI Sticker Generation
-def generate_ai_sticker(prompt, api_key=None):
-    """Generate sticker using DALL-E API (placeholder for now)"""
-    # NOTE: This is a placeholder. In production, you'd use:
-    # - OpenAI DALL-E API
-    # - Stability AI
-    # - Local models like Stable Diffusion
+def apply_warm_filter(image: Image.Image, intensity: float = 0.3) -> Image.Image:
+    """Apply warm filter with adjustable intensity"""
+    # Convert to array for OpenCV processing
+    img_array = np.array(image)
     
-    st.info("🤖 AI sticker generation coming soon! For now, upload your own stickers.")
-    return None
+    # Create warm filter effect
+    warm_filter = np.zeros_like(img_array, dtype=np.float32)
+    warm_filter[:, :, 0] = intensity * 50   # Add red
+    warm_filter[:, :, 1] = intensity * 30   # Add green
+    warm_filter[:, :, 2] = intensity * -10  # Reduce blue slightly
+    
+    # Apply filter
+    result = img_array.astype(np.float32) + warm_filter
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    
+    return Image.fromarray(result)
 
-# NEW: Background removal for user stickers
-def remove_background(image_pil):
-    """Remove background from uploaded sticker"""
-    if not REMBG_AVAILABLE:
-        st.warning("Background removal not available. Using image as-is.")
-        return image_pil
+def apply_vintage_filter(image: Image.Image, intensity: float = 0.3) -> Image.Image:
+    """Apply vintage filter effect"""
+    # Reduce saturation
+    enhancer = ImageEnhance.Color(image)
+    image = enhancer.enhance(1 - intensity * 0.3)
     
-    try:
-        # Convert PIL to bytes
-        img_bytes = io.BytesIO()
-        image_pil.save(img_bytes, format='PNG')
-        img_bytes.seek(0)
-        
-        # Remove background
-        output_bytes = remove(img_bytes.getvalue())
-        
-        # Convert back to PIL
-        output_image = Image.open(io.BytesIO(output_bytes)).convert('RGBA')
-        return output_image
-    except Exception as e:
-        st.error(f"Background removal failed: {e}")
-        return image_pil.convert('RGBA')
-
-# Enhanced image processing functions
-def apply_smart_warm_filter(image_cv, similarity_score):
-    """Apply warm filter with intensity based on style similarity"""
-    # Map similarity to filter intensity
-    if similarity_score > 0.8:
-        intensity = 1.2  # Strong warm filter
-        brightness = 25
-    elif similarity_score > 0.6:
-        intensity = 0.9  # Medium warm filter
-        brightness = 15
-    else:
-        intensity = 0.6  # Light warm filter
-        brightness = 8
-    
-    img_float = image_cv.astype(np.float32) / 255.0
-    
-    warm_matrix = np.array([
-        [1.0, 0.0, 0.0],
-        [0.1 * intensity, 1.0 + 0.1 * intensity, 0.0],
-        [0.0, 0.0, 1.0 - 0.2 * intensity]
+    # Add sepia tone
+    img_array = np.array(image).astype(np.float32)
+    sepia_filter = np.array([
+        [0.393 + 0.607 * (1 - intensity), 0.769 - 0.769 * (1 - intensity), 0.189 - 0.189 * (1 - intensity)],
+        [0.349 - 0.349 * (1 - intensity), 0.686 + 0.314 * (1 - intensity), 0.168 - 0.168 * (1 - intensity)],
+        [0.272 - 0.272 * (1 - intensity), 0.534 - 0.534 * (1 - intensity), 0.131 + 0.869 * (1 - intensity)]
     ])
     
-    warm_img = cv2.transform(img_float, warm_matrix)
-    return cv2.convertScaleAbs(warm_img * 255, alpha=1.0 + intensity * 0.1, beta=brightness)
+    result = img_array.dot(sepia_filter.T)
+    result = np.clip(result, 0, 255).astype(np.uint8)
+    
+    return Image.fromarray(result)
 
-def apply_smart_outline(image_cv, similarity_score):
-    """Apply outline with thickness based on style similarity"""
-    if similarity_score > 0.8:
-        thickness, blur = 3, 5  # Bold outlines
-    elif similarity_score > 0.6:
-        thickness, blur = 2, 3  # Medium outlines
+def apply_dreamy_filter(image: Image.Image, intensity: float = 0.3) -> Image.Image:
+    """Apply dreamy/soft filter effect"""
+    # Apply gaussian blur
+    blurred = image.filter(ImageFilter.GaussianBlur(radius=2 * intensity))
+    
+    # Blend original with blurred
+    result = Image.blend(image, blurred, intensity * 0.5)
+    
+    # Enhance brightness slightly
+    enhancer = ImageEnhance.Brightness(result)
+    result = enhancer.enhance(1 + intensity * 0.2)
+    
+    return result
+
+def apply_light_filter(image: Image.Image, intensity: float = 0.3) -> Image.Image:
+    """Apply light/bright filter effect"""
+    # Increase brightness and slight contrast
+    enhancer = ImageEnhance.Brightness(image)
+    result = enhancer.enhance(1 + intensity * 0.4)
+    
+    enhancer = ImageEnhance.Contrast(result)
+    result = enhancer.enhance(1 + intensity * 0.2)
+    
+    return result
+
+def create_doodle_outline(image: Image.Image, strength: float = 0.5, outline_type: str = "full") -> Image.Image:
+    """Create doodle-style outline overlay"""
+    # Convert to grayscale for edge detection
+    gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+    
+    # Apply edge detection with adjustable parameters based on strength
+    low_threshold = int(50 + (1 - strength) * 50)
+    high_threshold = int(150 + (1 - strength) * 100)
+    edges = cv2.Canny(gray, low_threshold, high_threshold)
+    
+    # Create outline image
+    outline_img = Image.fromarray(edges, mode='L')
+    outline_rgba = Image.new('RGBA', image.size, (0, 0, 0, 0))
+    
+    # Draw outline with transparency
+    for y in range(outline_img.height):
+        for x in range(outline_img.width):
+            if outline_img.getpixel((x, y)) > 128:  # Edge pixel
+                alpha = int(255 * strength)
+                outline_rgba.putpixel((x, y), (0, 0, 0, alpha))
+    
+    # Convert original to RGBA and composite
+    if image.mode != 'RGBA':
+        image = image.convert('RGBA')
+    
+    result = Image.alpha_composite(image, outline_rgba)
+    return result.convert('RGB')
+
+def remove_background(image: Image.Image) -> Image.Image:
+    """Remove background from image using rembg"""
+    try:
+        # Convert PIL image to bytes
+        img_bytes = BytesIO()
+        image.save(img_bytes, format='PNG')
+        img_bytes = img_bytes.getvalue()
+        
+        # Remove background
+        result_bytes = remove(img_bytes)
+        
+        # Convert back to PIL Image
+        result_image = Image.open(BytesIO(result_bytes))
+        return result_image
+    except Exception as e:
+        st.error(f"Background removal failed: {str(e)}")
+        return image
+
+def generate_ai_sticker(prompt: str, api_key: str) -> Optional[Image.Image]:
+    """Generate sticker using OpenAI DALL-E API"""
+    if not api_key:
+        st.warning("OpenAI API key not configured. Cannot generate AI stickers.")
+        return None
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": "dall-e-3",
+            "prompt": f"{prompt}, transparent background, sticker style, high quality",
+            "n": 1,
+            "size": "1024x1024",
+            "response_format": "url"
+        }
+        
+        response = requests.post(
+            "https://api.openai.com/v1/images/generations",
+            headers=headers,
+            json=data,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            image_url = result["data"][0]["url"]
+            
+            # Download and process image
+            img_response = requests.get(image_url)
+            if img_response.status_code == 200:
+                image = Image.open(BytesIO(img_response.content))
+                
+                # Remove background to ensure transparency
+                processed_image = remove_background(image)
+                
+                # Save to stickers directory
+                filename = f"ai_sticker_{len(os.listdir(STICKERS_DIR))}.png"
+                filepath = os.path.join(STICKERS_DIR, filename)
+                processed_image.save(filepath, "PNG")
+                
+                return processed_image
+        
+        st.error("Failed to generate AI sticker")
+        return None
+        
+    except Exception as e:
+        st.error(f"AI sticker generation error: {str(e)}")
+        return None
+
+def load_stickers() -> List[Tuple[str, Image.Image]]:
+    """Load all available stickers"""
+    stickers = []
+    if os.path.exists(STICKERS_DIR):
+        for filename in os.listdir(STICKERS_DIR):
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                try:
+                    filepath = os.path.join(STICKERS_DIR, filename)
+                    sticker = Image.open(filepath)
+                    if sticker.mode != 'RGBA':
+                        sticker = sticker.convert('RGBA')
+                    stickers.append((filename, sticker))
+                except:
+                    continue
+    return stickers
+
+def apply_sticker(base_image: Image.Image, sticker: Image.Image, position: Tuple[int, int], size: Tuple[int, int]) -> Image.Image:
+    """Apply sticker to base image at specified position and size"""
+    # Resize sticker
+    sticker_resized = sticker.resize(size, Image.Resampling.LANCZOS)
+    
+    # Convert base image to RGBA if needed
+    if base_image.mode != 'RGBA':
+        base_image = base_image.convert('RGBA')
+    
+    # Create a copy to work with
+    result = base_image.copy()
+    
+    # Paste sticker
+    if sticker_resized.mode == 'RGBA':
+        result.paste(sticker_resized, position, sticker_resized)
     else:
-        thickness, blur = 1, 2  # Light outlines
+        result.paste(sticker_resized, position)
     
-    gray = cv2.cvtColor(image_cv, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (blur*2+1, blur*2+1), 0)
-    
-    edges = cv2.Canny(blurred, 50, 150)
-    kernel = np.ones((thickness, thickness), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
-    
-    return cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-
-def get_available_stickers():
-    """Get list of available sticker files"""
-    sticker_files = []
-    for ext in ['*.png', '*.PNG']:
-        sticker_files.extend(STICKERS_DIR.glob(ext))
-    return sticker_files
-
-def cv2_to_pil(cv2_image):
-    """Convert OpenCV image to PIL"""
-    rgb_image = cv2.cvtColor(cv2_image, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(rgb_image)
-
-def pil_to_cv2(pil_image):
-    """Convert PIL image to OpenCV"""
-    rgb_array = np.array(pil_image.convert('RGB'))
-    return cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
-
-def overlay_smart_stickers(base_image_pil, similarity_score):
-    """Overlay stickers based on style similarity"""
-    available_stickers = get_available_stickers()
-    if not available_stickers:
-        return base_image_pil
-    
-    img_width, img_height = base_image_pil.size
-    result_image = base_image_pil.convert('RGBA')
-    
-    # Determine sticker style based on similarity
-    if similarity_score > 0.8:
-        sticker_count = min(3, len(available_stickers))  # Bold: more stickers
-        opacity = 0.9
-    elif similarity_score > 0.6:
-        sticker_count = min(2, len(available_stickers))  # Medium: some stickers
-        opacity = 0.8
-    else:
-        sticker_count = min(1, len(available_stickers))  # Minimal: few stickers
-        opacity = 0.7
-    
-    # Add stickers
-    for i in range(sticker_count):
-        sticker_path = available_stickers[i % len(available_stickers)]
-        try:
-            sticker = Image.open(sticker_path).convert('RGBA')
-            sticker = sticker.resize((80, 80), Image.Resampling.LANCZOS)
-            
-            # Apply opacity
-            alpha = sticker.split()[-1]
-            alpha = alpha.point(lambda p: int(p * opacity))
-            sticker.putalpha(alpha)
-            
-            # Position stickers
-            if i == 0:
-                pos = (int(img_width * 0.8), int(img_height * 0.1))
-            elif i == 1:
-                pos = (int(img_width * 0.1), int(img_height * 0.85))
-            else:
-                pos = (int(img_width * 0.7), int(img_height * 0.6))
-            
-            result_image.paste(sticker, pos, sticker)
-        except Exception as e:
-            st.warning(f"Could not load sticker {sticker_path}: {e}")
-    
-    return result_image.convert('RGB')
-
-def process_image_with_ai_style(uploaded_image, style_learner, model, processor, device):
-    """Process image using learned AI style"""
-    pil_image = Image.open(uploaded_image)
-    cv_image = pil_to_cv2(pil_image)
-    
-    # Get style similarity
-    similarity = style_learner.get_style_similarity(pil_image, model, processor, device)
-    
-    # Apply smart filters
-    warm_image = apply_smart_warm_filter(cv_image, similarity)
-    outline = apply_smart_outline(cv_image, similarity)
-    
-    # Blend warm image with outline
-    outline_gray = cv2.cvtColor(outline, cv2.COLOR_BGR2GRAY)
-    outline_mask = outline_gray > 0
-    
-    final_cv = warm_image.copy()
-    final_cv[outline_mask] = final_cv[outline_mask] * 0.7
-    
-    final_pil = cv2_to_pil(final_cv)
-    
-    # Add smart stickers
-    final_pil = overlay_smart_stickers(final_pil, similarity)
-    
-    return final_pil, similarity
+    return result.convert('RGB')
 
 def main():
-    st.title("🤖 Learning AI Stylist")
-    st.markdown("*An AI that learns your aesthetic and gets better over time*")
-    st.markdown("---")
+    st.set_page_config(
+        page_title="AI Stylist - Learning Image Editor",
+        page_icon="🎨",
+        layout="wide"
+    )
     
-    # Initialize components
-    model, processor, device = load_clip_model()
-    if model is None:
-        st.error("❌ Could not load CLIP model. Please check your internet connection.")
-        st.info("💡 The app will work with basic functionality, but AI learning features will be disabled.")
-        # You can still provide basic image processing here
-        st.stop()
+    st.title("🎨 AI Stylist - Learning Image Editor")
+    st.markdown("*An AI-powered image editor that learns your aesthetic preferences over time*")
     
-    # NEW: Initialize style learner
-    style_learner = StyleLearner()
+    # Initialize AI Styler
+    if 'ai_styler' not in st.session_state:
+        st.session_state.ai_styler = AIStyler()
+        st.session_state.current_image_embedding = None
+        st.session_state.processed_image = None
     
-    # Sidebar for AI learning controls
+    ai_styler = st.session_state.ai_styler
+    
+    # Sidebar for configuration
     with st.sidebar:
-        st.header("🧠 AI Style Learning")
+        st.header("⚙️ Configuration")
         
-        # Show current style status
-        if style_learner.style_vector is not None:
-            ref_count = len(style_learner.reference_embeddings)
-            feedback_count = len(style_learner.feedback_history)
-            likes = sum(1 for f in style_learner.feedback_history if f.get('liked', False))
+        # Check if style vector exists
+        style_exists = ai_styler.load_style_vector()
+        
+        if style_exists:
+            st.success(f"✅ Style learned from {len(ai_styler.reference_embeddings)} reference images")
             
-            st.success("✅ AI Style Learned!")
-            st.metric("Reference Images", ref_count)
-            st.metric("Feedback Given", feedback_count)
-            st.metric("Liked Images", likes)
-            
-            if st.button("🗑️ Reset Style Learning"):
-                if os.path.exists(STYLE_DATA_FILE):
-                    os.remove(STYLE_DATA_FILE)
-                if os.path.exists(FEEDBACK_DATA_FILE):
-                    os.remove(FEEDBACK_DATA_FILE)
-                st.success("Style data reset! Refresh the page.")
-                st.stop()
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🔄 Update Style"):
+                    st.session_state.update_style = True
+            with col2:
+                if st.button("🗑️ Reset Style"):
+                    if os.path.exists(STYLE_VECTOR_PATH):
+                        os.remove(STYLE_VECTOR_PATH)
+                    ai_styler.style_vector = None
+                    ai_styler.reference_embeddings = []
+                    st.rerun()
         else:
-            st.warning("🤔 No style learned yet")
-            st.info("👇 Upload reference images to start learning!")
-        
-        st.markdown("---")
-        
-        # NEW: Reference image learning
-        st.subheader("📁 Style Learning")
-        reference_images = st.file_uploader(
-            "Upload 3-10 reference images (your aesthetic style)",
-            type=['jpg', 'jpeg', 'png'],
-            accept_multiple_files=True,
-            help="Upload images that represent your preferred editing style"
-        )
-        
-        if reference_images and len(reference_images) >= 3:
-            if st.button("🎯 Learn My Style"):
-                with st.spinner("🧠 Learning your aesthetic preferences..."):
-                    learned_count = style_learner.learn_from_references(
-                        reference_images, model, processor, device
-                    )
-                    if learned_count > 0:
-                        st.success(f"✅ Learned from {learned_count} images!")
-                        st.rerun()
-                    else:
-                        st.error("❌ Could not learn from reference images")
-        elif reference_images:
-            st.warning(f"Upload at least 3 images (you have {len(reference_images)})")
-        
-        st.markdown("---")
-        
-        # NEW: Sticker management
-        st.subheader("🎪 Sticker Management")
-        
-        # Show available stickers
-        available_stickers = get_available_stickers()
-        st.info(f"📁 {len(available_stickers)} stickers available")
-        
-        # User sticker upload with background removal
-        user_sticker = st.file_uploader(
-            "Upload custom sticker",
-            type=['jpg', 'jpeg', 'png'],
-            help="Upload any image - background will be removed automatically"
-        )
-        
-        if user_sticker:
-            if st.button("✂️ Process & Save Sticker"):
-                with st.spinner("🔄 Removing background..."):
-                    try:
-                        img = Image.open(user_sticker)
-                        processed_img = remove_background(img)
-                        
-                        # Save processed sticker
-                        sticker_name = f"custom_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                        sticker_path = STICKERS_DIR / sticker_name
-                        processed_img.save(sticker_path)
-                        
-                        st.success(f"✅ Sticker saved as {sticker_name}")
-                        st.image(processed_img, caption="Processed sticker", width=100)
-                    except Exception as e:
-                        st.error(f"Error processing sticker: {e}")
-        
-        # NEW: AI sticker generation (placeholder)
-        if st.button("🤖 Generate AI Stickers"):
-            generate_ai_sticker("cute kawaii sticker")
-        
-        st.markdown("---")
-        
-        # Main image upload
-        uploaded_file = st.file_uploader(
-            "📸 Upload photo to style",
-            type=['jpg', 'jpeg', 'png']
-        )
+            st.warning("📚 No style learned yet. Upload reference images to get started!")
+            st.session_state.update_style = True
     
     # Main content area
-    if uploaded_file is not None:
-        col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.header("📸 Upload & Configure")
         
-        with col1:
-            st.subheader("📸 Original")
-            original_image = Image.open(uploaded_file)
-            st.image(original_image, use_column_width=True)
-        
-        with col2:
-            st.subheader("🎨 AI Styled")
+        # Handle style learning/updating
+        if not style_exists or st.session_state.get('update_style', False):
+            st.subheader("🎭 Learn Your Aesthetic Style")
+            st.markdown("Upload 3+ reference images that represent your preferred aesthetic:")
             
-            if style_learner.style_vector is not None:
-                # Process with learned style
-                with st.spinner("🎨 Applying your learned aesthetic..."):
-                    styled_image, similarity = process_image_with_ai_style(
-                        uploaded_file, style_learner, model, processor, device
-                    )
-                    
-                    st.image(styled_image, use_column_width=True)
-                    
-                    # Show style analysis
-                    st.metric("Style Similarity", f"{similarity:.2%}")
-                    
-                    if similarity > 0.8:
-                        st.success("🎯 Perfect match! Applied bold styling")
-                    elif similarity > 0.6:
-                        st.info("👍 Good match! Applied medium styling")
-                    else:
-                        st.warning("🤔 Different style. Applied light styling")
-                    
-                    # NEW: Feedback section
-                    st.markdown("---")
-                    st.write("**How do you like this result?**")
-                    
-                    feedback_col1, feedback_col2 = st.columns(2)
-                    with feedback_col1:
-                        if st.button("👍 Love it!", use_container_width=True):
-                            if style_learner.update_from_feedback(
-                                styled_image, model, processor, device, liked=True
-                            ):
-                                st.success("✅ Thanks! AI learned from your feedback")
-                                st.rerun()
-                    
-                    with feedback_col2:
-                        if st.button("👎 Not my style", use_container_width=True):
-                            st.info("📝 Feedback noted. AI won't learn from this image.")
-                    
-                    # Download button
-                    img_buffer = io.BytesIO()
-                    styled_image.save(img_buffer, format='PNG')
-                    img_buffer.seek(0)
-                    
-                    st.download_button(
-                        label="💾 Download Styled Image",
-                        data=img_buffer,
-                        file_name=f"ai_styled_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-                        mime="image/png",
-                        use_container_width=True
-                    )
-            else:
-                st.warning("🤔 No style learned yet. Upload reference images first!")
-                st.info("👈 Use the sidebar to upload reference images and teach the AI your style")
-    
-    else:
-        st.info("👆 Upload an image to see AI styling in action!")
-    
-    # Information section
-    st.markdown("---")
-    with st.expander("🤖 How the Learning AI Works"):
-        st.markdown("""
-        **This AI stylist learns and improves over time:**
+            reference_files = st.file_uploader(
+                "Choose reference images",
+                type=['png', 'jpg', 'jpeg'],
+                accept_multiple_files=True,
+                key="reference_uploader"
+            )
+            
+            if reference_files and len(reference_files) >= 3:
+                if st.button("🧠 Learn Style from References"):
+                    with st.spinner("Analyzing your aesthetic preferences..."):
+                        embeddings = []
+                        for i, ref_file in enumerate(reference_files):
+                            try:
+                                ref_image = Image.open(ref_file).convert('RGB')
+                                embedding = ai_styler.extract_image_embedding(ref_image)
+                                embeddings.append(embedding)
+                                
+                                # Save reference image
+                                ref_path = os.path.join(REFERENCE_IMAGES_DIR, f"ref_{i}_{ref_file.name}")
+                                ref_image.save(ref_path)
+                                
+                            except Exception as e:
+                                st.error(f"Error processing {ref_file.name}: {str(e)}")
+                        
+                        if embeddings:
+                            ai_styler.save_style_vector(embeddings)
+                            st.success(f"✅ Style learned from {len(embeddings)} images!")
+                            st.session_state.update_style = False
+                            st.rerun()
+            elif reference_files:
+                st.warning(f"Please upload at least 3 reference images (uploaded: {len(reference_files)})")
         
-        1. **🎯 Initial Learning**: Upload 3-10 reference images showing your preferred aesthetic
-        2. **🧠 Style Embedding**: AI creates a "style vector" representing your preferences using CLIP
-        3. **📊 Smart Analysis**: For each new image, AI measures similarity to your learned style
-        4. **🎨 Adaptive Styling**: Applies filters, outlines, and stickers based on similarity:
-           - High similarity (80%+): Bold, strong effects
-           - Medium similarity (60-80%): Balanced styling  
-           - Low similarity (<60%): Gentle, minimal effects
-        5. **📈 Continuous Learning**: Your 👍/👎 feedback updates the AI's understanding
-        6. **🎪 Smart Stickers**: Auto background removal for custom stickers
-        
-        **The more you use it, the better it gets at matching your style!**
-        """)
+        # Image upload for editing
+        if ai_styler.style_vector is not None:
+            st.subheader("🖼️ Upload Image to Edit")
+            uploaded_file = st.file_uploader(
+                "Choose an image to style",
+                type=['png', 'jpg', 'jpeg'],
+                key="main_uploader"
+            )
+            
+            if uploaded_file:
+                # Load and display original image
+                original_image = Image.open(uploaded_file).convert('RGB')
+                st.image(original_image, caption="Original Image", use_column_width=True)
+                
+                # Extract embedding and calculate similarity
+                with st.spinner("Analyzing image..."):
+                    image_embedding = ai_styler.extract_image_embedding(original_image)
+                    similarity = ai_styler.calculate_similarity(image_embedding) * 100
+                    st.session_state.current_image_embedding = image_embedding
+                
+                st.info(f"📊 Style Similarity: {similarity:.1f}%")
+                
+                # Editing controls
+                st.subheader("🎛️ Editing Controls")
+                
+                # Filter selection
+                filter_type = st.selectbox(
+                    "Filter Type",
+                    ["warm", "vintage", "dreamy", "light"],
+                    help="Choose the type of filter to apply"
+                )
+                
+                # Filter intensity based on similarity
+                base_intensity = 0.3 + (similarity / 100) * 0.4  # 0.3 to 0.7 range
+                filter_intensity = st.slider(
+                    "Filter Intensity",
+                    0.0, 1.0, base_intensity,
+                    help="AI-suggested intensity based on your style"
+                )
+                
+                # Outline controls
+                outline_option = st.selectbox(
+                    "Outline Application",
+                    ["none", "full", "subject_only"],
+                    help="Where to apply doodle outlines"
+                )
+                
+                if outline_option != "none":
+                    outline_strength = st.slider(
+                        "Outline Strength",
+                        0.1, 1.0, 0.3 + (similarity / 100) * 0.4
+                    )
+                
+                # Process image
+                if st.button("✨ Apply AI Styling"):
+                    with st.spinner("Applying AI styling..."):
+                        result_image = original_image.copy()
+                        
+                        # Apply selected filter
+                        if filter_type == "warm":
+                            result_image = apply_warm_filter(result_image, filter_intensity)
+                        elif filter_type == "vintage":
+                            result_image = apply_vintage_filter(result_image, filter_intensity)
+                        elif filter_type == "dreamy":
+                            result_image = apply_dreamy_filter(result_image, filter_intensity)
+                        elif filter_type == "light":
+                            result_image = apply_light_filter(result_image, filter_intensity)
+                        
+                        # Apply outline if requested
+                        if outline_option == "full":
+                            result_image = create_doodle_outline(result_image, outline_strength, "full")
+                        elif outline_option == "subject_only":
+                            # For subject-only, we'd ideally use object detection
+                            # For now, apply to full image with reduced strength
+                            result_image = create_doodle_outline(result_image, outline_strength * 0.7, "subject")
+                        
+                        st.session_state.processed_image = result_image
     
-    # Footer
-    st.markdown("---")
-    st.markdown(
-        "<div style='text-align: center; color: #666;'>"
-        "🤖 Learning AI Stylist • Gets smarter with every interaction"
-        "</div>", 
-        unsafe_allow_html=True
-    )
+    with col2:
+        st.header("🎨 Results & Stickers")
+        
+        # Display processed image
+        if st.session_state.processed_image is not None:
+            st.subheader("✨ Styled Image")
+            st.image(st.session_state.processed_image, caption="AI Styled Result", use_column_width=True)
+            
+            # Feedback section
+            st.subheader("👍 Feedback")
+            col_like, col_dislike = st.columns(2)
+            
+            with col_like:
+                if st.button("👍 Love it!", key="like_btn"):
+                    if st.session_state.current_image_embedding is not None:
+                        ai_styler.update_style_with_feedback(
+                            st.session_state.current_image_embedding, 
+                            True
+                        )
+                        st.success("Thanks! I've learned from this image to better match your style.")
+            
+            with col_dislike:
+                if st.button("👎 Not quite", key="dislike_btn"):
+                    st.info("Got it! I won't learn from this image.")
+            
+            # Download button
+            if st.session_state.processed_image:
+                buf = BytesIO()
+                st.session_state.processed_image.save(buf, format="PNG")
+                st.download_button(
+                    label="💾 Download Styled Image",
+                    data=buf.getvalue(),
+                    file_name=f"ai_styled_{uploaded_file.name}",
+                    mime="image/png"
+                )
+        
+        # Sticker section
+        st.subheader("🔖 Stickers")
+        
+        # AI Sticker Generation
+        with st.expander("🤖 Generate AI Stickers"):
+            sticker_prompts = [
+                "aesthetic doodle of a flower",
+                "hand-drawn yellow star outline in cute style",
+                "warm-toned vintage sparkle sticker",
+                "minimalist heart doodle",
+                "boho-style moon and stars",
+                "kawaii cloud with face"
+            ]
+            
+            selected_prompt = st.selectbox("Choose prompt", sticker_prompts)
+            custom_prompt = st.text_input("Or enter custom prompt:")
+            
+            final_prompt = custom_prompt if custom_prompt else selected_prompt
+            
+            if st.button("🎨 Generate AI Sticker"):
+                if OPENAI_API_KEY:
+                    with st.spinner("Generating AI sticker..."):
+                        ai_sticker = generate_ai_sticker(final_prompt, OPENAI_API_KEY)
+                        if ai_sticker:
+                            st.success("AI sticker generated!")
+                            st.image(ai_sticker, caption="Generated Sticker", width=200)
+                else:
+                    st.warning("OpenAI API key not configured")
+        
+        # Custom Sticker Upload
+        with st.expander("📤 Upload Custom Sticker"):
+            sticker_file = st.file_uploader(
+                "Upload sticker (background will be removed)",
+                type=['png', 'jpg', 'jpeg'],
+                key="sticker_uploader"
+            )
+            
+            if sticker_file:
+                sticker_image = Image.open(sticker_file)
+                
+                if st.button("🗑️ Remove Background & Save"):
+                    with st.spinner("Processing sticker..."):
+                        processed_sticker = remove_background(sticker_image)
+                        
+                        # Save processed sticker
+                        filename = f"custom_{len(os.listdir(STICKERS_DIR))}_{sticker_file.name}"
+                        filepath = os.path.join(STICKERS_DIR, filename)
+                        processed_sticker.save(filepath, "PNG")
+                        
+                        st.success("Sticker saved!")
+                        st.image(processed_sticker, caption="Processed Sticker", width=200)
+        
+        # Available Stickers
+        stickers = load_stickers()
+        if stickers:
+            st.subheader("📚 Available Stickers")
+            
+            # Display stickers in grid
+            cols = st.columns(3)
+            for i, (name, sticker) in enumerate(stickers[:9]):  # Show first 9
+                with cols[i % 3]:
+                    st.image(sticker, caption=name[:15], width=100)
+                    
+                    if st.session_state.processed_image and st.button(f"Add", key=f"add_sticker_{i}"):
+                        # Simple sticker application (center position)
+                        img_width, img_height = st.session_state.processed_image.size
+                        sticker_size = (min(img_width, img_height) // 6, min(img_width, img_height) // 6)
+                        position = (img_width // 2 - sticker_size[0] // 2, img_height // 2 - sticker_size[1] // 2)
+                        
+                        st.session_state.processed_image = apply_sticker(
+                            st.session_state.processed_image,
+                            sticker,
+                            position,
+                            sticker_size
+                        )
+                        st.rerun()
 
 if __name__ == "__main__":
     main()
