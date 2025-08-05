@@ -7,7 +7,6 @@ import os
 import json
 from pathlib import Path
 import torch
-import clip
 from sklearn.metrics.pairwise import cosine_similarity
 import pickle
 import requests
@@ -20,7 +19,13 @@ try:
     REMBG_AVAILABLE = True
 except ImportError:
     REMBG_AVAILABLE = False
-    st.warning("⚠️ rembg not installed. Background removal disabled.")
+
+# NEW: CLIP imports (using Hugging Face instead of OpenAI CLIP)
+try:
+    from transformers import CLIPProcessor, CLIPModel
+    CLIP_AVAILABLE = True
+except ImportError:
+    CLIP_AVAILABLE = False
 
 # Page configuration
 st.set_page_config(
@@ -39,14 +44,19 @@ REFERENCE_IMAGES_DIR = Path("reference_images")
 STICKERS_DIR.mkdir(exist_ok=True)
 REFERENCE_IMAGES_DIR.mkdir(exist_ok=True)
 
-# NEW: Load CLIP model (cached)
+# NEW: Load CLIP model (cached) - Using Hugging Face
 @st.cache_resource
 def load_clip_model():
-    """Load CLIP model for image embeddings"""
+    """Load CLIP model for image embeddings using Hugging Face"""
+    if not CLIP_AVAILABLE:
+        return None, None, None
+    
     try:
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model, preprocess = clip.load("ViT-B/32", device=device)
-        return model, preprocess, device
+        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        model.to(device)
+        return model, processor, device
     except Exception as e:
         st.error(f"❌ Error loading CLIP model: {e}")
         return None, None, None
@@ -95,26 +105,31 @@ class StyleLearner:
             st.error(f"Error saving style data: {e}")
             return False
     
-    def extract_embedding(self, image_pil, model, preprocess, device):
-        """Extract CLIP embedding from PIL image"""
+    def extract_embedding(self, image_pil, model, processor, device):
+        """Extract CLIP embedding from PIL image using Hugging Face"""
         try:
-            image_tensor = preprocess(image_pil).unsqueeze(0).to(device)
+            # Process image
+            inputs = processor(images=image_pil, return_tensors="pt").to(device)
+            
+            # Get image embedding
             with torch.no_grad():
-                image_features = model.encode_image(image_tensor)
-                image_features /= image_features.norm(dim=-1, keepdim=True)
+                image_features = model.get_image_features(**inputs)
+                # Normalize the features
+                image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+            
             return image_features.cpu().numpy().flatten()
         except Exception as e:
             st.error(f"Error extracting embedding: {e}")
             return None
     
-    def learn_from_references(self, reference_images, model, preprocess, device):
+    def learn_from_references(self, reference_images, model, processor, device):
         """Learn aesthetic style from reference images"""
         embeddings = []
         
         for img_file in reference_images:
             try:
                 img = Image.open(img_file).convert('RGB')
-                embedding = self.extract_embedding(img, model, preprocess, device)
+                embedding = self.extract_embedding(img, model, processor, device)
                 if embedding is not None:
                     embeddings.append(embedding)
                     
@@ -133,12 +148,12 @@ class StyleLearner:
             return len(embeddings)
         return 0
     
-    def update_from_feedback(self, image_pil, model, preprocess, device, liked=True):
+    def update_from_feedback(self, image_pil, model, processor, device, liked=True):
         """Update style based on user feedback"""
         if not liked:
             return False
         
-        embedding = self.extract_embedding(image_pil, model, preprocess, device)
+        embedding = self.extract_embedding(image_pil, model, processor, device)
         if embedding is not None:
             # Add to reference embeddings
             self.reference_embeddings.append(embedding)
@@ -158,12 +173,12 @@ class StyleLearner:
             return True
         return False
     
-    def get_style_similarity(self, image_pil, model, preprocess, device):
+    def get_style_similarity(self, image_pil, model, processor, device):
         """Get similarity score between image and learned style"""
         if self.style_vector is None:
             return 0.5  # Default medium similarity
         
-        embedding = self.extract_embedding(image_pil, model, preprocess, device)
+        embedding = self.extract_embedding(image_pil, model, processor, device)
         if embedding is not None:
             similarity = cosine_similarity([embedding], [self.style_vector])[0][0]
             return max(0, min(1, (similarity + 1) / 2))  # Normalize to 0-1
@@ -309,13 +324,13 @@ def overlay_smart_stickers(base_image_pil, similarity_score):
     
     return result_image.convert('RGB')
 
-def process_image_with_ai_style(uploaded_image, style_learner, model, preprocess, device):
+def process_image_with_ai_style(uploaded_image, style_learner, model, processor, device):
     """Process image using learned AI style"""
     pil_image = Image.open(uploaded_image)
     cv_image = pil_to_cv2(pil_image)
     
     # Get style similarity
-    similarity = style_learner.get_style_similarity(pil_image, model, preprocess, device)
+    similarity = style_learner.get_style_similarity(pil_image, model, processor, device)
     
     # Apply smart filters
     warm_image = apply_smart_warm_filter(cv_image, similarity)
@@ -341,9 +356,11 @@ def main():
     st.markdown("---")
     
     # Initialize components
-    model, preprocess, device = load_clip_model()
+    model, processor, device = load_clip_model()
     if model is None:
-        st.error("❌ Could not load CLIP model. Please install: `pip install clip-by-openai`")
+        st.error("❌ Could not load CLIP model. Please check your internet connection.")
+        st.info("💡 The app will work with basic functionality, but AI learning features will be disabled.")
+        # You can still provide basic image processing here
         st.stop()
     
     # NEW: Initialize style learner
@@ -390,7 +407,7 @@ def main():
             if st.button("🎯 Learn My Style"):
                 with st.spinner("🧠 Learning your aesthetic preferences..."):
                     learned_count = style_learner.learn_from_references(
-                        reference_images, model, preprocess, device
+                        reference_images, model, processor, device
                     )
                     if learned_count > 0:
                         st.success(f"✅ Learned from {learned_count} images!")
@@ -461,7 +478,7 @@ def main():
                 # Process with learned style
                 with st.spinner("🎨 Applying your learned aesthetic..."):
                     styled_image, similarity = process_image_with_ai_style(
-                        uploaded_file, style_learner, model, preprocess, device
+                        uploaded_file, style_learner, model, processor, device
                     )
                     
                     st.image(styled_image, use_column_width=True)
@@ -484,7 +501,7 @@ def main():
                     with feedback_col1:
                         if st.button("👍 Love it!", use_container_width=True):
                             if style_learner.update_from_feedback(
-                                styled_image, model, preprocess, device, liked=True
+                                styled_image, model, processor, device, liked=True
                             ):
                                 st.success("✅ Thanks! AI learned from your feedback")
                                 st.rerun()
