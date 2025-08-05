@@ -1,9 +1,9 @@
 streamlit
-opencv-python-headless
 Pillow
 numpy
 torch
 clip-anytorch
 rembg
 scikit-learn
+scikit-image
 requests

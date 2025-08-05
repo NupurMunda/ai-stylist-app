@@ -1,6 +1,6 @@
 import streamlit as st
 import numpy as np
-import cv2 as cv2
+from skimage import filters, color, feature
 from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
 import pickle
 import os
@@ -169,12 +169,13 @@ def apply_light_filter(image: Image.Image, intensity: float = 0.3) -> Image.Imag
 def create_doodle_outline(image: Image.Image, strength: float = 0.5, outline_type: str = "full") -> Image.Image:
     """Create doodle-style outline overlay"""
     # Convert to grayscale for edge detection
-    gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
+    gray = color.rgb2gray(np.array(image))  # float32 grayscale
     
     # Apply edge detection with adjustable parameters based on strength
     low_threshold = int(50 + (1 - strength) * 50)
     high_threshold = int(150 + (1 - strength) * 100)
-    edges = cv2.Canny(gray, low_threshold, high_threshold)
+    edges = feature.canny(gray, low_threshold=low_threshold/255.0, high_threshold=high_threshold/255.0)
+    edges = (edges * 255).astype(np.uint8)  # Convert to 0–255
     
     # Create outline image
     outline_img = Image.fromarray(edges, mode='L')
