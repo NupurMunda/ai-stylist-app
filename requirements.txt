@@ -1,9 +1,8 @@
-streamlit
-Pillow
-numpy
-torch
-rembg
-scikit-learn
-scikit-image
-requests
-git+https://github.com/omerbt/clip-anytorch.git
+streamlit>=1.28.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+torch>=2.0.0
+transformers>=4.30.0
+rembg>=2.0.50
+scikit-learn>=1.3.0
