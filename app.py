@@ -31,7 +31,6 @@ def apply_filter(image, filter_name):
         img = Image.blend(img, overlay, alpha=0.1)
     elif filter_name == "Paris / Pastel / Soft":
         img = enhancer.enhance(0.8)
-        # Simple pink overlay
         overlay = Image.new('RGB', img.size, (255, 192, 203))
         img = Image.blend(img, overlay, alpha=0.1)
     elif filter_name == "Vivid / Vibrant":
@@ -40,12 +39,10 @@ def apply_filter(image, filter_name):
         img = enhancer.enhance(0.7)
         img = ImageEnhance.Contrast(img).enhance(1.2)
     elif filter_name == "Sepia / Brown":
-        # Simple sepia effect
         grayscale_img = img.convert("L")
         sepia_overlay = Image.new('RGB', img.size, (112, 66, 20))
         img = Image.blend(grayscale_img.convert("RGB"), sepia_overlay, alpha=0.3)
     elif filter_name == "Teal & Orange":
-        # Simplified teal and orange effect
         img = ImageEnhance.Color(img).enhance(1.2)
         r, g, b = img.split()
         r = r.point(lambda p: p * 0.9)
@@ -55,11 +52,9 @@ def apply_filter(image, filter_name):
     elif filter_name == "Desaturated / Minimalist":
         img = enhancer.enhance(0.5)
     elif filter_name == "Pink Tint / Rosy Glow":
-        # Pink overlay
         overlay = Image.new('RGB', img.size, (255, 192, 203))
         img = Image.blend(img, overlay, alpha=0.15)
     elif filter_name == "Cool Tone / Blue Tint":
-        # Blue overlay
         overlay = Image.new('RGB', img.size, (0, 0, 255))
         img = Image.blend(img, overlay, alpha=0.1)
     elif filter_name == "Moody / Dark":
@@ -99,22 +94,31 @@ def load_controlnet_pipeline():
     """
     try:
         hf_token = st.secrets["HF_TOKEN"]
-        
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if device == "cuda" else torch.float32
+
         controlnet = ControlNetModel.from_pretrained(
-            "lllyasviel/control_v11p_sd15_reference",
-            torch_dtype=torch.float16,
+            "lllyasviel/control_v11e_sd15_shuffle",   # Corrected model ID
+            torch_dtype=dtype,
             token=hf_token,
-            use_safetensors=False
+            use_safetensors=True
         )
+
         pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             controlnet=controlnet,
-            torch_dtype=torch.float16,
-            token=hf_token  # Corrected: Token is now passed here
-        ).to("cuda" if torch.cuda.is_available() else "cpu")
+            torch_dtype=dtype,
+            token=hf_token
+        ).to(device)
+
+        # Optional memory helpers
+        pipe.enable_attention_slicing()
+        if device == "cuda":
+            pipe.enable_xformers_memory_efficient_attention()
+
         return pipe
     except Exception as e:
-        st.error(f"Failed to load the pipeline. Ensure you have a Hugging Face token configured correctly. Error: {e}")
+        st.error(f"Failed to load pipeline: {e}")
         return None
 
 def generate_prompt(add_doodle, add_sticker, add_text, custom_text):
@@ -140,17 +144,16 @@ def generate_edit_with_controlnet(pipe, reference_image, target_image, prompt):
         return None
     
     try:
-        # Resize images for the model
         reference_image = reference_image.resize((512, 512))
         target_image = target_image.resize((512, 512))
         
-        # Generate image
         output = pipe(
             prompt=prompt,
             image=target_image,
             control_image=reference_image,
-            num_inference_steps=20,
-            strength=0.8,
+            controlnet_conditioning_scale=0.8,  # New parameter for style strength
+            num_inference_steps=30,
+            strength=0.75,
             guidance_scale=7.5
         ).images[0]
         
@@ -166,13 +169,9 @@ def generate_edit_with_controlnet(pipe, reference_image, target_image, prompt):
 st.title("🎨 Image Stylizer App")
 st.markdown("Edit a target image to match the aesthetic of a reference image using **ControlNet** and **Stable Diffusion**.")
 
-# Initialize session state for the generated image
 if 'generated_image' not in st.session_state:
     st.session_state.generated_image = None
 
-# ---
-# Image Upload Section
-# ---
 st.header("1. Image Upload")
 col1, col2 = st.columns(2)
 
@@ -190,9 +189,6 @@ with col2:
         target_image = Image.open(target_file).convert("RGB")
         st.image(target_image, caption="Target Image", use_column_width=True)
 
-# ---
-# Aesthetic Options Section
-# ---
 st.markdown("---")
 st.header("2. Advanced Aesthetic Options")
 col1, col2, col3 = st.columns(3)
@@ -211,12 +207,10 @@ st.markdown("---")
 st.header("3. Generate AI Edit")
 if st.button("🚀 Generate Stylized Image"):
     if reference_file and target_file:
-        with st.spinner("Generating your stylized image... Please wait, this may take a moment."):
-            # Corrected logic: Call the pipeline once and get the full pipe object
+        with st.spinner("Generating your stylized image... This may take a moment."):
             pipe = load_controlnet_pipeline()
             prompt = generate_prompt(add_doodle, add_sticker, add_text, custom_text)
             
-            # Call the image generation function with the pipe
             generated_image = generate_edit_with_controlnet(pipe, reference_image, target_image, prompt)
             
             st.session_state.generated_image = generated_image
@@ -258,9 +252,6 @@ if st.session_state.generated_image:
         selected_filter
     )
     
-    # ---
-    # Final Output Section
-    # ---
     st.markdown("---")
     st.header("5. Final Output")
     st.image(tweaked_image, caption="Final Stylized Image", use_column_width=True)
