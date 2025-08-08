@@ -7,6 +7,7 @@ from transformers import CLIPProcessor, CLIPModel
 from rembg import remove
 import io
 import pickle
+import os # Import the os library
 
 # --- Setup and Initialization ---
 
@@ -273,6 +274,10 @@ with st.sidebar:
     st.header("3. User Sticker Options")
     uploaded_sticker = st.file_uploader("Upload your own sticker (PNG/JPG):", type=['png', 'jpg', 'jpeg'])
     if uploaded_sticker:
+        # Create the 'stickers' directory if it doesn't exist
+        if not os.path.exists("stickers"):
+            os.makedirs("stickers")
+        
         # Remove background from uploaded sticker
         sticker_bytes = uploaded_sticker.read()
         sticker_no_bg = remove(sticker_bytes)
