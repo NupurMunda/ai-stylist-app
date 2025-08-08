@@ -101,9 +101,11 @@ def load_controlnet_pipeline():
     Loads and caches the Stable Diffusion ControlNet pipeline.
     """
     try:
+        hf_token = st.secrets["HF_TOKEN"]
         controlnet = ControlNetModel.from_pretrained(
             "lllyasviel/control_v11p_sd15_reference",
             torch_dtype=torch.float16,
+            token=hf_token,
             use_safetensors=False
         )
         pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
