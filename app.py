@@ -3,6 +3,7 @@ import torch
 from PIL import Image, ImageEnhance, ImageFilter
 from diffusers import StableDiffusionControlNetImg2ImgPipeline, ControlNetModel
 import io
+import numpy as np
 
 # Set page configuration
 st.set_page_config(
@@ -18,52 +19,102 @@ st.set_page_config(
 # Function to simulate a filter effect
 def apply_filter(image, filter_name):
     """
-    Applies a filter effect to an image using PIL.
-    Note: This is a simplified simulation, not a true filter.
+    Applies a filter effect to an image using more advanced PIL techniques.
     """
     img = image.convert("RGB")
     enhancer = ImageEnhance.Color(img)
     
     if filter_name == "Warm / Golden Hour":
+        img = ImageEnhance.Brightness(img).enhance(1.1)
         img = enhancer.enhance(1.2)
-        # Simple orange overlay
-        overlay = Image.new('RGB', img.size, (255, 150, 0))
+        r, g, b = img.split()
+        r = r.point(lambda p: p * 1.1)
+        g = g.point(lambda p: p * 1.05)
+        img = Image.merge('RGB', (r, g, b))
+        overlay = Image.new('RGB', img.size, (255, 180, 50))
         img = Image.blend(img, overlay, alpha=0.1)
+    
     elif filter_name == "Paris / Pastel / Soft":
         img = enhancer.enhance(0.8)
+        img = ImageEnhance.Contrast(img).enhance(0.9)
         overlay = Image.new('RGB', img.size, (255, 192, 203))
         img = Image.blend(img, overlay, alpha=0.1)
+    
     elif filter_name == "Vivid / Vibrant":
         img = enhancer.enhance(1.5)
+        img = ImageEnhance.Contrast(img).enhance(1.2)
+    
     elif filter_name == "Retro / Film / Grainy":
         img = enhancer.enhance(0.7)
         img = ImageEnhance.Contrast(img).enhance(1.2)
+        # Add a light noise/grain overlay
+        noise = np.random.normal(0, 15, img.size[::-1] + (3,))
+        noise_img = Image.fromarray(np.uint8(np.clip(noise, 0, 255)))
+        img = Image.blend(img, noise_img, alpha=0.08)
+    
     elif filter_name == "Sepia / Brown":
-        grayscale_img = img.convert("L")
-        sepia_overlay = Image.new('RGB', img.size, (112, 66, 20))
-        img = Image.blend(grayscale_img.convert("RGB"), sepia_overlay, alpha=0.3)
-    elif filter_name == "Teal & Orange":
-        img = ImageEnhance.Color(img).enhance(1.2)
+        img = img.convert("L").convert("RGB")
         r, g, b = img.split()
-        r = r.point(lambda p: p * 0.9)
-        g = g.point(lambda p: p * 1.1)
+        r = r.point(lambda p: p * 1.0)
+        g = g.point(lambda p: p * 0.8)
+        b = b.point(lambda p: p * 0.6)
+        img = Image.merge('RGB', (r, g, b))
+    
+    elif filter_name == "Teal & Orange":
+        img = enhancer.enhance(1.3)
+        r, g, b = img.split()
+        r = r.point(lambda p: p * 1.1)
+        g = g.point(lambda p: p * 0.9)
         b = b.point(lambda p: p * 1.2)
         img = Image.merge('RGB', (r, g, b))
+        img = ImageEnhance.Contrast(img).enhance(1.1)
+    
     elif filter_name == "Desaturated / Minimalist":
         img = enhancer.enhance(0.5)
+        img = ImageEnhance.Contrast(img).enhance(1.1)
+    
     elif filter_name == "Pink Tint / Rosy Glow":
         overlay = Image.new('RGB', img.size, (255, 192, 203))
         img = Image.blend(img, overlay, alpha=0.15)
+        img = ImageEnhance.Brightness(img).enhance(1.05)
+    
     elif filter_name == "Cool Tone / Blue Tint":
         overlay = Image.new('RGB', img.size, (0, 0, 255))
         img = Image.blend(img, overlay, alpha=0.1)
+        img = ImageEnhance.Contrast(img).enhance(1.1)
+    
     elif filter_name == "Moody / Dark":
         img = ImageEnhance.Contrast(img).enhance(1.5)
         img = ImageEnhance.Brightness(img).enhance(0.7)
+    
     elif filter_name == "Creamy / Soft Blur":
         img = img.filter(ImageFilter.BoxBlur(1))
         img = ImageEnhance.Contrast(img).enhance(0.9)
+
+    elif filter_name == "Fujifilm / Kodak":
+        img = ImageEnhance.Color(img).enhance(1.2)
+        r, g, b = img.split()
+        # Simulate film color shifts
+        r = r.point(lambda p: p * 1.05)
+        g = g.point(lambda p: p * 1.1)
+        b = b.point(lambda p: p * 0.95)
+        img = Image.merge('RGB', (r, g, b))
+        img = ImageEnhance.Contrast(img).enhance(1.1)
     
+    elif filter_name == "Dazzle / Sparkle":
+        img = ImageEnhance.Brightness(img).enhance(1.2)
+        img = ImageEnhance.Contrast(img).enhance(1.2)
+        # Add high-frequency noise for a sparkling effect
+        noise = np.random.normal(0, 30, img.size[::-1] + (3,))
+        noise_img = Image.fromarray(np.uint8(np.clip(noise, 0, 255)))
+        img = Image.blend(img, noise_img, alpha=0.15)
+
+    elif filter_name == "HDR / Clarity":
+        # Simulate local contrast enhancement
+        sharpened = img.filter(ImageFilter.SHARPEN)
+        img = Image.blend(img, sharpened, alpha=0.5)
+        img = ImageEnhance.Contrast(img).enhance(1.5)
+        
     return img
 
 def apply_manual_tweaks(image, brightness, contrast, saturation, filter_name):

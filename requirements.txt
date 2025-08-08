@@ -6,3 +6,4 @@ accelerate
 Pillow
 requests
 huggingface-hub
+numpy
