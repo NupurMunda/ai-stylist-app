@@ -1,10 +1,5 @@
+replicate
 streamlit
-torch
-diffusers>=0.24.0
-transformers
-accelerate
 Pillow
 requests
-huggingface-hub
 numpy
-replicate
