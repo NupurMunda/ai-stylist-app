@@ -1,10 +1,8 @@
 import streamlit as st
 import torch
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 from diffusers import StableDiffusionControlNetImg2ImgPipeline, ControlNetModel
-from huggingface_hub import hf_hub_download
 import io
-import requests
 
 # Set page configuration
 st.set_page_config(
@@ -70,7 +68,6 @@ def apply_filter(image, filter_name):
     elif filter_name == "Creamy / Soft Blur":
         img = img.filter(ImageFilter.BoxBlur(1))
         img = ImageEnhance.Contrast(img).enhance(0.9)
-    # The rest are not easily simulated and are left out for brevity.
     
     return img
 
@@ -102,6 +99,7 @@ def load_controlnet_pipeline():
     """
     try:
         hf_token = st.secrets["HF_TOKEN"]
+        
         controlnet = ControlNetModel.from_pretrained(
             "lllyasviel/control_v11p_sd15_reference",
             torch_dtype=torch.float16,
@@ -111,11 +109,12 @@ def load_controlnet_pipeline():
         pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             controlnet=controlnet,
-            torch_dtype=torch.float16
+            torch_dtype=torch.float16,
+            token=hf_token  # Corrected: Token is now passed here
         ).to("cuda" if torch.cuda.is_available() else "cpu")
         return pipe
     except Exception as e:
-        st.error(f"Failed to load the pipeline. Ensure you have a Hugging Face token configured locally or have a suitable environment. Error: {e}")
+        st.error(f"Failed to load the pipeline. Ensure you have a Hugging Face token configured correctly. Error: {e}")
         return None
 
 def generate_prompt(add_doodle, add_sticker, add_text, custom_text):
@@ -213,21 +212,14 @@ st.header("3. Generate AI Edit")
 if st.button("🚀 Generate Stylized Image"):
     if reference_file and target_file:
         with st.spinner("Generating your stylized image... Please wait, this may take a moment."):
+            # Corrected logic: Call the pipeline once and get the full pipe object
             pipe = load_controlnet_pipeline()
             prompt = generate_prompt(add_doodle, add_sticker, add_text, custom_text)
             
-            # The function `generate_edit_with_controlnet` would be called here.
-            # For demonstration, we'll simulate the output since a full HF pipeline
-            # cannot be run within a public, free Streamlit app due to resource limits.
-            # In a real-world scenario, the `generate_edit_with_controlnet` function
-            # would be called and its output stored in the session state.
-            # For this example, we'll just show the target image as a placeholder.
+            # Call the image generation function with the pipe
+            generated_image = generate_edit_with_controlnet(pipe, reference_image, target_image, prompt)
             
-            # Simulated Call:
-            # generated_image = generate_edit_with_controlnet(pipe, reference_image, target_image, prompt)
-            
-            # Placeholder for the generated image
-            st.session_state.generated_image = target_image.copy()  # Use target image as a placeholder
+            st.session_state.generated_image = generated_image
 
             if st.session_state.generated_image:
                 st.success("Image generated successfully!")
