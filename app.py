@@ -1,9 +1,11 @@
 import streamlit as st
 import torch
-from PIL import Image, ImageEnhance, ImageFilter
-from diffusers import StableDiffusionControlNetImg2ImgPipeline, ControlNetModel
+import time
+import requests
 import io
 import numpy as np
+from PIL import Image, ImageEnhance, ImageFilter
+import replicate
 
 # Set page configuration
 st.set_page_config(
@@ -20,14 +22,91 @@ st.write({
 })
 
 # ---
+# Replicate API Functions
+# ---
+
+@st.cache_resource
+def get_replicate_client():
+    """Returns a cached Replicate client."""
+    token = st.secrets.get("REPLICATE_API_TOKEN")
+    if not token:
+        st.error("Replicate API token not found. Please add `REPLICATE_API_TOKEN` to your Streamlit secrets.")
+        st.stop()
+    return replicate.Client(api_token=token)
+
+def replicate_upload_image(client, pil_img: Image.Image) -> str:
+    """Uploads a PIL image to Replicate's temporary CDN."""
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    buf.seek(0)
+    uploaded = client.files.upload(buf, filename="image.png")
+    return uploaded.url
+
+def resize_max_side(pil_img: Image.Image, max_side=1024) -> Image.Image:
+    """Resizes an image so its longest side is no more than max_side."""
+    w, h = pil_img.size
+    scale = max(w, h) / max_side
+    if scale <= 1: 
+        return pil_img
+    return pil_img.resize((int(w/scale), int(h/scale)), Image.LANCZOS)
+
+def run_controlnet_generation(prompt, ref_img, negative_prompt, conditioning_scale, num_steps, guidance_scale, controlnet_type):
+    """
+    Calls the ControlNet model on Replicate with the correct schema.
+    """
+    client = get_replicate_client()
+
+    ref_img = resize_max_side(ref_img)
+    ref_url = replicate_upload_image(client, ref_img)
+
+    # You must replace this with a valid model slug and version
+    MODEL_SLUG = "fofr/sdxl-multi-controlnet-lora:89eb212b3d1366a83e949c12a4b45dfe6b6b313b594cb8268e864931ac9ffb16"
+
+    inputs = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "apply_watermark": False,
+        "controlnet_1": controlnet_type,
+        "controlnet_1_image": ref_url,
+        "controlnet_1_conditioning_scale": conditioning_scale,
+        "num_inference_steps": num_steps,
+        "guidance_scale": guidance_scale,
+    }
+
+    st.write({"model_slug": MODEL_SLUG, "inputs": inputs})
+    pred = client.predictions.create(model=MODEL_SLUG, input=inputs)
+
+    status = st.empty()
+    wait = 1
+    while pred.status not in ("succeeded", "failed", "canceled"):
+        status.write(f"Status: {pred.status}")
+        time.sleep(wait)
+        pred = client.predictions.get(pred.id)
+        wait = min(wait * 1.5, 5)
+
+    if pred.status != "succeeded":
+        raise RuntimeError(f"Replicate failed with status: {pred.status}. Error: {getattr(pred, 'error', None) or pred.output}")
+    
+    # Correctly handle Replicate's different output types
+    output = pred.output
+    if isinstance(output, list):
+        first = output[0]
+    else:
+        first = output
+    
+    if hasattr(first, "url"):
+        out_url = first.url
+    else:
+        out_url = str(first)
+
+    img_bytes = requests.get(out_url).content
+    return Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+# ---
 # UI Elements and Helper Functions
 # ---
 
-# Function to apply filter effects using advanced PIL techniques
 def apply_filter(image, filter_name):
-    """
-    Applies a filter effect to an image using more advanced PIL techniques.
-    """
     img = image.convert("RGB")
     enhancer = ImageEnhance.Color(img)
     
@@ -135,105 +214,26 @@ def apply_manual_tweaks(image, brightness, contrast, saturation, filter_name):
 
     return img
 
-# ---
-# AI Logic
-# ---
-
-@st.cache_resource
-def load_controlnet_pipeline():
-    try:
-        hf_token = st.secrets["HF_TOKEN"]
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device == "cuda" else torch.float32
-
-        controlnet = ControlNetModel.from_pretrained(
-            "lllyasviel/control_v11e_sd15_shuffle",
-            torch_dtype=dtype,
-            token=hf_token,
-            use_safetensors=True,
-            low_cpu_mem_usage=True
-        )
-
-        pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
-            "runwayml/stable-diffusion-v1-5",
-            controlnet=controlnet,
-            torch_dtype=dtype,
-            token=hf_token,
-            safety_checker=None,
-            requires_safety_checker=False,
-            low_cpu_mem_usage=True
-        )
-
-        pipe.to(device)
-        pipe.enable_attention_slicing()
-
-        if device == "cuda":
-            # Guard xformers — only enable if import works
-            try:
-                import xformers
-                pipe.enable_xformers_memory_efficient_attention()
-            except ImportError:
-                pass
-            # Offload larger modules between GPU/CPU to avoid OOM
-            try:
-                pipe.enable_model_cpu_offload()
-            except Exception:
-                pass
-            torch.backends.cuda.matmul.allow_tf32 = True
-        else:
-            # On CPU, offload sequentially to keep memory low
-            try:
-                pipe.enable_sequential_cpu_offload()
-            except Exception:
-                pass
-
-        return pipe
-    except Exception as e:
-        st.error(f"Failed to load pipeline: {e}")
-        return None
-
 def generate_prompt(add_doodle, add_sticker, add_text, custom_text):
-    prompt = "Edit the target image to match the aesthetic of the reference image. "
+    """
+    Dynamically generates a prompt based on user selections.
+    """
+    prompt = "Edit the image to match the aesthetic of the reference image. "
     if add_doodle:
         prompt += "Add doodles. "
     if add_sticker:
         prompt += "Include stickers. "
     if add_text and custom_text:
         prompt += f"Add the text: '{custom_text}' in a matching style. "
-    prompt += "Preserve the subject of the target image."
+    prompt += "Preserve the subject of the image."
     return prompt
-
-def generate_edit_with_controlnet(pipe, reference_image, target_image, prompt):
-    if pipe is None:
-        st.error("AI pipeline is not loaded. Cannot generate image.")
-        return None
-    try:
-        reference_image = reference_image.resize((512, 512), Image.LANCZOS)
-        target_image = target_image.resize((512, 512), Image.LANCZOS)
-
-        on_cuda = torch.cuda.is_available()
-        steps = 24 if on_cuda else 18
-
-        output = pipe(
-            prompt=prompt,
-            image=target_image,
-            control_image=reference_image,
-            controlnet_conditioning_scale=0.7,
-            num_inference_steps=steps,
-            strength=0.7,
-            guidance_scale=7.0
-        ).images[0]
-        return output
-    except Exception as e:
-        st.error(f"AI generation failed. Error: {e}")
-        return None
 
 # ---
 # Streamlit App Layout
 # ---
 
 st.title("🎨 Image Stylizer App")
-st.markdown("Edit a target image to match the aesthetic of a reference image using **ControlNet** and **Stable Diffusion**.")
+st.markdown("Use a **reference image** to guide the style of a generated image.")
 
 if 'generated_image' not in st.session_state:
     st.session_state.generated_image = None
@@ -243,20 +243,16 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Reference Image (Style)")
-    reference_file = st.file_uploader("Upload an image with the desired aesthetic.", type=["png", "jpg", "jpeg"])
+    st.markdown("This image provides the aesthetic style, layout, and subject for the AI to follow.")
+    reference_file = st.file_uploader("Upload a reference image.", type=["png", "jpg", "jpeg"])
     if reference_file:
         reference_image = Image.open(reference_file).convert("RGB")
-        st.image(reference_image, caption="Reference Image", use_column_width=True)
-
-with col2:
-    st.subheader("Target Image (Subject)")
-    target_file = st.file_uploader("Upload the image you want to edit.", type=["png", "jpg", "jpeg"])
-    if target_file:
-        target_image = Image.open(target_file).convert("RGB")
-        st.image(target_image, caption="Target Image", use_column_width=True)
+        st.image(reference_image, caption="Reference Image", use_container_width=True)
 
 st.markdown("---")
-st.header("2. Advanced Aesthetic Options")
+st.header("2. Prompt and Aesthetic Options")
+st.markdown("This prompt will guide the AI in stylizing the reference image.")
+
 col1, col2, col3 = st.columns(3)
 add_doodle = col1.checkbox("Add doodles")
 add_sticker = col2.checkbox("Add stickers")
@@ -265,25 +261,55 @@ add_text = col3.checkbox("Add text")
 custom_text = ""
 if add_text:
     custom_text = st.text_input("Enter the text to add:", "Hello, World!")
+    
+negative_prompt = st.text_input(
+    "Negative Prompt (Optional):", 
+    value="blurry, ugly, poor quality, bad colors"
+)
+
+with st.expander("Advanced Settings"):
+    col1, col2 = st.columns(2)
+    num_inference_steps = col1.slider("Inference Steps", 10, 50, 28, 1)
+    guidance_scale = col2.slider("Guidance Scale", 1.0, 15.0, 7.0, 0.5)
+
+    col3, col4 = st.columns(2)
+    conditioning_scale = col3.slider("ControlNet Conditioning Scale", 0.0, 2.0, 0.7, 0.1)
+
+    controlnet_type_options = ["shuffle", "soft_edge_hed", "canny", "depth"]
+    selected_controlnet_type = st.selectbox(
+        "Select ControlNet Type:",
+        options=controlnet_type_options,
+        index=0
+    )
+
 
 st.markdown("---")
 st.header("3. Generate AI Edit")
 if st.button("🚀 Generate Stylized Image"):
-    if reference_file and target_file:
-        with st.spinner("Generating your stylized image... This may take a moment."):
-            pipe = load_controlnet_pipeline()
+    if reference_file:
+        with st.spinner("Generating on GPU (Replicate)... This may take a moment."):
             prompt = generate_prompt(add_doodle, add_sticker, add_text, custom_text)
             
-            generated_image = generate_edit_with_controlnet(pipe, reference_image, target_image, prompt)
-            
-            st.session_state.generated_image = generated_image
-
-            if st.session_state.generated_image:
-                st.success("Image generated successfully!")
-            else:
-                st.error("Failed to generate image. Please check the logs.")
+            try:
+                result_img = run_controlnet_generation(
+                    prompt, 
+                    reference_image, 
+                    negative_prompt, 
+                    conditioning_scale,
+                    num_inference_steps,
+                    guidance_scale,
+                    selected_controlnet_type
+                )
+                
+                if result_img is not None:
+                    st.session_state.generated_image = result_img
+                    st.success("Image generated successfully!")
+                else:
+                    st.error("Generation failed. Check the logs for details.")
+            except Exception as e:
+                st.error(f"Remote inference failed: {e}")
     else:
-        st.warning("Please upload both a reference and a target image first.")
+        st.warning("Please upload a reference image first.")
 
 if st.session_state.generated_image:
     st.markdown("---")
@@ -314,7 +340,7 @@ if st.session_state.generated_image:
     
     st.markdown("---")
     st.header("5. Final Output")
-    st.image(tweaked_image, caption="Final Stylized Image", use_column_width=True)
+    st.image(tweaked_image, caption="Final Stylized Image", use_container_width=True)
     
     buf = io.BytesIO()
     tweaked_image.save(buf, format="PNG")
