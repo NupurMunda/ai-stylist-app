@@ -1,7 +1,7 @@
-streamlit
-opencv-python
-Pillow
-numpy
-torch
-transformers
-rembg
+streamlit==1.36.0
+opencv-python-headless==4.8.1.78
+Pillow==10.3.0
+numpy==1.26.4
+torch==2.3.1
+transformers==4.42.3
+rembg==2.0.50
