@@ -12,11 +12,18 @@ st.set_page_config(
     layout="wide"
 )
 
+# A small diagnostic block to check the environment
+st.write({
+    "cuda_available": torch.cuda.is_available(),
+    "device": "cuda" if torch.cuda.is_available() else "cpu",
+    "torch_version": torch.__version__
+})
+
 # ---
 # UI Elements and Helper Functions
 # ---
 
-# Function to simulate a filter effect
+# Function to apply filter effects using advanced PIL techniques
 def apply_filter(image, filter_name):
     """
     Applies a filter effect to an image using more advanced PIL techniques.
@@ -47,7 +54,6 @@ def apply_filter(image, filter_name):
     elif filter_name == "Retro / Film / Grainy":
         img = enhancer.enhance(0.7)
         img = ImageEnhance.Contrast(img).enhance(1.2)
-        # Add a light noise/grain overlay
         noise = np.random.normal(0, 15, img.size[::-1] + (3,))
         noise_img = Image.fromarray(np.uint8(np.clip(noise, 0, 255)))
         img = Image.blend(img, noise_img, alpha=0.08)
@@ -94,7 +100,6 @@ def apply_filter(image, filter_name):
     elif filter_name == "Fujifilm / Kodak":
         img = ImageEnhance.Color(img).enhance(1.2)
         r, g, b = img.split()
-        # Simulate film color shifts
         r = r.point(lambda p: p * 1.05)
         g = g.point(lambda p: p * 1.1)
         b = b.point(lambda p: p * 0.95)
@@ -104,13 +109,11 @@ def apply_filter(image, filter_name):
     elif filter_name == "Dazzle / Sparkle":
         img = ImageEnhance.Brightness(img).enhance(1.2)
         img = ImageEnhance.Contrast(img).enhance(1.2)
-        # Add high-frequency noise for a sparkling effect
         noise = np.random.normal(0, 30, img.size[::-1] + (3,))
         noise_img = Image.fromarray(np.uint8(np.clip(noise, 0, 255)))
         img = Image.blend(img, noise_img, alpha=0.15)
 
     elif filter_name == "HDR / Clarity":
-        # Simulate local contrast enhancement
         sharpened = img.filter(ImageFilter.SHARPEN)
         img = Image.blend(img, sharpened, alpha=0.5)
         img = ImageEnhance.Contrast(img).enhance(1.5)
@@ -123,12 +126,10 @@ def apply_manual_tweaks(image, brightness, contrast, saturation, filter_name):
     """
     img = image.copy()
     
-    # Apply manual adjustments
     img = ImageEnhance.Brightness(img).enhance(brightness)
     img = ImageEnhance.Contrast(img).enhance(contrast)
     img = ImageEnhance.Color(img).enhance(saturation)
 
-    # Apply filter
     if filter_name != "None":
         img = apply_filter(img, filter_name)
 
@@ -140,32 +141,51 @@ def apply_manual_tweaks(image, brightness, contrast, saturation, filter_name):
 
 @st.cache_resource
 def load_controlnet_pipeline():
-    """
-    Loads and caches the Stable Diffusion ControlNet pipeline.
-    """
     try:
         hf_token = st.secrets["HF_TOKEN"]
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
 
         controlnet = ControlNetModel.from_pretrained(
-            "lllyasviel/control_v11e_sd15_shuffle",   # Corrected model ID
+            "lllyasviel/control_v11e_sd15_shuffle",
             torch_dtype=dtype,
             token=hf_token,
-            use_safetensors=True
+            use_safetensors=True,
+            low_cpu_mem_usage=True
         )
 
         pipe = StableDiffusionControlNetImg2ImgPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             controlnet=controlnet,
             torch_dtype=dtype,
-            token=hf_token
-        ).to(device)
+            token=hf_token,
+            safety_checker=None,
+            requires_safety_checker=False,
+            low_cpu_mem_usage=True
+        )
 
-        # Optional memory helpers
+        pipe.to(device)
         pipe.enable_attention_slicing()
+
         if device == "cuda":
-            pipe.enable_xformers_memory_efficient_attention()
+            # Guard xformers — only enable if import works
+            try:
+                import xformers
+                pipe.enable_xformers_memory_efficient_attention()
+            except ImportError:
+                pass
+            # Offload larger modules between GPU/CPU to avoid OOM
+            try:
+                pipe.enable_model_cpu_offload()
+            except Exception:
+                pass
+            torch.backends.cuda.matmul.allow_tf32 = True
+        else:
+            # On CPU, offload sequentially to keep memory low
+            try:
+                pipe.enable_sequential_cpu_offload()
+            except Exception:
+                pass
 
         return pipe
     except Exception as e:
@@ -173,9 +193,6 @@ def load_controlnet_pipeline():
         return None
 
 def generate_prompt(add_doodle, add_sticker, add_text, custom_text):
-    """
-    Dynamically generates a prompt based on user selections.
-    """
     prompt = "Edit the target image to match the aesthetic of the reference image. "
     if add_doodle:
         prompt += "Add doodles. "
@@ -187,27 +204,25 @@ def generate_prompt(add_doodle, add_sticker, add_text, custom_text):
     return prompt
 
 def generate_edit_with_controlnet(pipe, reference_image, target_image, prompt):
-    """
-    Calls the ControlNet pipeline to generate a stylized image.
-    """
     if pipe is None:
         st.error("AI pipeline is not loaded. Cannot generate image.")
         return None
-    
     try:
-        reference_image = reference_image.resize((512, 512))
-        target_image = target_image.resize((512, 512))
-        
+        reference_image = reference_image.resize((512, 512), Image.LANCZOS)
+        target_image = target_image.resize((512, 512), Image.LANCZOS)
+
+        on_cuda = torch.cuda.is_available()
+        steps = 24 if on_cuda else 18
+
         output = pipe(
             prompt=prompt,
             image=target_image,
             control_image=reference_image,
-            controlnet_conditioning_scale=0.8,  # New parameter for style strength
-            num_inference_steps=30,
-            strength=0.75,
-            guidance_scale=7.5
+            controlnet_conditioning_scale=0.7,
+            num_inference_steps=steps,
+            strength=0.7,
+            guidance_scale=7.0
         ).images[0]
-        
         return output
     except Exception as e:
         st.error(f"AI generation failed. Error: {e}")
@@ -251,9 +266,6 @@ custom_text = ""
 if add_text:
     custom_text = st.text_input("Enter the text to add:", "Hello, World!")
 
-# ---
-# AI-Powered Edit Button
-# ---
 st.markdown("---")
 st.header("3. Generate AI Edit")
 if st.button("🚀 Generate Stylized Image"):
@@ -273,9 +285,6 @@ if st.button("🚀 Generate Stylized Image"):
     else:
         st.warning("Please upload both a reference and a target image first.")
 
-# ---
-# Manual Tweaks Section
-# ---
 if st.session_state.generated_image:
     st.markdown("---")
     st.header("4. Manual Tweaks")
@@ -291,7 +300,7 @@ if st.session_state.generated_image:
             "None", "Warm / Golden Hour", "Paris / Pastel / Soft", "Vivid / Vibrant", 
             "Retro / Film / Grainy", "Sepia / Brown", "Teal & Orange", 
             "Desaturated / Minimalist", "Pink Tint / Rosy Glow", "Cool Tone / Blue Tint", 
-            "Moody / Dark", "Creamy / Soft Blur"
+            "Moody / Dark", "Creamy / Soft Blur", "Fujifilm / Kodak", "Dazzle / Sparkle", "HDR / Clarity"
         ]
         selected_filter = st.selectbox("Select a Filter:", filter_options)
         
@@ -307,7 +316,6 @@ if st.session_state.generated_image:
     st.header("5. Final Output")
     st.image(tweaked_image, caption="Final Stylized Image", use_column_width=True)
     
-    # Download button
     buf = io.BytesIO()
     tweaked_image.save(buf, format="PNG")
     st.download_button(
