@@ -3,3 +3,4 @@ streamlit
 Pillow
 requests
 numpy
+torch
