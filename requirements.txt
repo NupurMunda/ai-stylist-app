@@ -1,6 +1,6 @@
 streamlit
 torch
-diffusers
+diffusers>=0.24.0
 transformers
 accelerate
 Pillow
